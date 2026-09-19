@@ -17,7 +17,7 @@ __author__ = "@exteraGram"
 __version__ = "1.0.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
-__sdk_version__ = ">=1.4.4.3"
+__sdk_version__ = ">=1.4.3.3"
 
 
 class AvatarTask(dynamic_proxy(Runnable)):
