@@ -141,6 +141,10 @@ class AvatarStackerPlugin(BasePlugin):
                     self._notify(params.peer, "No avatar task is running.", account)
                 return HookResult(strategy=HookStrategy.CANCEL)
 
+            if text.lower() == ".avacount":
+                self._send_avatar_count(params.peer, account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
             m = re.match(r"^\.ava\s+(\d{1,4})\s*$", text, re.IGNORECASE)
             if not m:
                 return HookResult()
@@ -232,6 +236,31 @@ class AvatarStackerPlugin(BasePlugin):
             self.handler.postDelayed(AvatarTask(lambda: self._do_history_stack(account, peer, count)), 3000)
         else:
             self._notify(peer, msg, account)
+
+    def _send_avatar_count(self, peer, account):
+        try:
+            req = TLRPC.TL_photos_getUserPhotos()
+            req.user_id = TLRPC.TL_inputUserSelf()
+            req.offset = 0
+            req.max_id = 0
+            req.limit = 1000
+            with self._scope(account):
+                send_request(req, RequestCallback(lambda response, error, _self=self, _p=peer, _a=account: _self._on_avatar_count(_p, _a, response, error)))
+        except Exception as e:
+            self._notify(peer, f"Could not count avatars: {e}", account)
+
+    def _on_avatar_count(self, peer, account, response, error):
+        try:
+            if error is not None or response is None:
+                self._notify(peer, "Could not count avatars.", account)
+                return
+            count = getattr(response, "count", None)
+            if count is None:
+                photos = getattr(response, "photos", None)
+                count = photos.size() if photos is not None else 0
+            self._notify(peer, f"Avatar count: {count}", account)
+        except Exception as e:
+            log(f"AvatarStacker: count parse error: {e}")
 
     def _enqueue_stack(self, account, peer, in_photo, count):
         if self.job_active:
