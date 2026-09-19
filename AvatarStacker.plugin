@@ -1,0 +1,256 @@
+import re
+import traceback
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import send_request, RequestCallback, send_text, get_messages_controller, get_user_config
+from android_utils import log
+from android.os import Handler, Looper
+from java.lang import Runnable
+from java.chaquopy import dynamic_proxy
+from org.telegram.tgnet import TLRPC
+from ui.settings import Header, Text, Divider, Switch, Input
+
+__id__ = "avatar_stacker"
+__name__ = "Avatar Stacker"
+__description__ = "Sets a photo as your profile avatar N times. Send a photo to Saved Messages, then reply to it (or write in the caption) `.ava <count>`."
+__author__ = "@exteraGram"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+
+class AvatarTask(dynamic_proxy(Runnable)):
+    def __init__(self, runnable):
+        super().__init__()
+        self.runnable = runnable
+
+    def run(self):
+        self.runnable()
+
+
+class AvatarStackerPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self.handler = Handler(Looper.getMainLooper())
+        self.add_on_send_message_hook()
+        self.job_active = False
+        self.history_pending = False
+        self.stack_total = 0
+        self.stack_done = 0
+        self.self_ids = {}
+
+    def create_settings(self):
+        return [
+            Header(text="Avatar Stacker"),
+            Text(text="Send a photo to Saved Messages (Избранное), then reply to it with `.ava <count>`, or attach the photo with the caption `.ava <count>`."),
+            Divider(),
+            Switch(key="enabled", text="Enabled", default=True),
+            Input(key="max_count", text="Max avatar count", default="500", subtext="Hard limit per command"),
+            Input(key="delay_sec", text="Delay between sets (sec)", default="1.2", subtext="Lower values may trigger flood limits"),
+        ]
+
+    def _int_setting(self, key, default):
+        try:
+            return abs(int(float(self.get_setting(key, default))))
+        except (ValueError, TypeError):
+            return default
+
+    def _float_setting(self, key, default):
+        try:
+            return float(self.get_setting(key, default))
+        except (ValueError, TypeError):
+            return default
+
+    def _self_id(self, account):
+        uid = self.self_ids.get(account)
+        if uid is not None:
+            return uid
+        try:
+            user = get_user_config(account).getCurrentUser()
+            uid = user.id
+            self.self_ids[account] = uid
+            return uid
+        except Exception as e:
+            log(f"AvatarStacker: can't get self id: {e}")
+            return None
+
+    def _is_saved(self, account, peer):
+        uid = self._self_id(account)
+        return uid is not None and peer == uid
+
+    def _notify(self, peer, text, account):
+        try:
+            send_text(peer, text, account=account)
+        except Exception as e:
+            log(f"AvatarStacker: notify error: {e}")
+
+    def _build_input_photo(self, photo):
+        if photo is None or not isinstance(photo, TLRPC.TL_photo):
+            return None
+        in_photo = TLRPC.TL_inputPhoto()
+        in_photo.id = photo.id
+        in_photo.access_hash = photo.access_hash
+        fr = getattr(photo, "file_reference", None)
+        in_photo.file_reference = bytearray(0) if fr is None else fr
+        return in_photo
+
+    def _get_input_photo_from_message(self, message_object):
+        if message_object is None:
+            return None
+        try:
+            owner = getattr(message_object, "messageOwner", None)
+            if owner is None:
+                return None
+            media = getattr(owner, "media", None)
+            if media is None:
+                return None
+            if not isinstance(media, TLRPC.TL_messageMediaPhoto):
+                return None
+            return self._build_input_photo(media.photo)
+        except Exception as e:
+            log(f"AvatarStacker: extract photo error: {e}")
+            return None
+
+    def on_send_message_hook(self, account, params):
+        try:
+            if not hasattr(params, "message") or not isinstance(params.message, str):
+                return HookResult()
+            text = params.message.strip()
+            if not self.get_setting("enabled", True):
+                return HookResult()
+
+            if text.lower() == ".avastop":
+                if self.job_active:
+                    self.job_active = False
+                    self._notify(params.peer, "Avatar stacking stopped.", account)
+                else:
+                    self._notify(params.peer, "No avatar task is running.", account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            m = re.match(r"^\.ava\s+(\d{1,4})\s*$", text, re.IGNORECASE)
+            if not m:
+                return HookResult()
+
+            count = int(m.group(1))
+            max_count = self._int_setting("max_count", 500)
+            if count < 1:
+                self._notify(params.peer, "Usage: .ava <count> (min 1)", account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+            if count > max_count:
+                self._notify(params.peer, f"Count too high. Max is {max_count}.", account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            peer = params.peer
+
+            in_photo = None
+            reply = getattr(params, "replyToMsg", None)
+            if reply is not None:
+                in_photo = self._get_input_photo_from_message(reply)
+
+            if in_photo is None and self._is_saved(account, peer):
+                self._schedule_history_stack(account, peer, count)
+                return HookResult()
+
+            if in_photo is None:
+                self._notify(peer, "Reply to a photo with .ava <count>, or run it inside Saved Messages.", account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            self._enqueue_stack(account, peer, in_photo, count)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            log(f"AvatarStacker: hook error: {e}\n{traceback.format_exc()}")
+            return HookResult()
+
+    def _schedule_history_stack(self, account, peer, count):
+        if self.job_active or self.history_pending:
+            self._notify(peer, "Another avatar task is already running.", account)
+            return
+        self.history_pending = True
+        wait_ms = int(self._float_setting("delay_sec", 1.2) * 1000) + 3000
+        self.handler.postDelayed(AvatarTask(lambda: self._do_history_stack(account, peer, count)), wait_ms)
+
+    def _do_history_stack(self, account, peer, count):
+        self.history_pending = False
+        try:
+            req = TLRPC.TL_messages_getHistory()
+            req.peer = get_messages_controller(account).getInputPeer(peer)
+            req.offset_id = 0
+            req.offset_date = 0
+            req.add_offset = 0
+            req.limit = 40
+            req.max_id = 0
+            req.min_id = 0
+            req.hash = 0
+            send_request(req, RequestCallback(lambda response, error, _self=self, _a=account, _p=peer, _c=count: _self._on_history(_a, _p, _c, 0, response, error)), account=account)
+        except Exception as e:
+            log(f"AvatarStacker: getHistory error: {e}\n{traceback.format_exc()}")
+
+    def _on_history(self, account, peer, count, attempt, response, error):
+        try:
+            if error is not None or response is None:
+                self._retry_history(account, peer, count, attempt, "Could not load the message history.")
+                return
+
+            messages = getattr(response, "messages", None)
+            best = None
+            if messages is not None:
+                for msg in messages:
+                    try:
+                        media = getattr(msg, "media", None)
+                        if media is not None and isinstance(media, TLRPC.TL_messageMediaPhoto) and isinstance(media.photo, TLRPC.TL_photo):
+                            best = self._build_input_photo(media.photo)
+                            if best is not None:
+                                break
+                    except Exception:
+                        continue
+
+            if best is None:
+                self._retry_history(account, peer, count, attempt, "No photo found in Saved Messages.")
+                return
+
+            self._enqueue_stack(account, peer, best, count)
+        except Exception as e:
+            log(f"AvatarStacker: history parse error: {e}\n{traceback.format_exc()}")
+
+    def _retry_history(self, account, peer, count, attempt, msg):
+        if attempt < 4:
+            self.handler.postDelayed(AvatarTask(lambda: self._do_history_stack(account, peer, count)), 3000)
+        else:
+            self._notify(peer, msg, account)
+
+    def _enqueue_stack(self, account, peer, in_photo, count):
+        if self.job_active:
+            self._notify(peer, "Another avatar task is already running.", account)
+            return
+        self.job_active = True
+        self.stack_total = count
+        self.stack_done = 0
+        self._do_next(account, peer, in_photo)
+
+    def _do_next(self, account, peer, in_photo):
+        if not self.job_active:
+            return
+        try:
+            req = TLRPC.TL_photos_updateProfilePhoto()
+            req.flags = 0
+            req.photo = in_photo
+            send_request(req, RequestCallback(lambda response, error, _self=self, _a=account, _p=peer, _i=in_photo: _self._on_avatar_result(_a, _p, _i, response, error)), account=account)
+        except Exception as e:
+            self.job_active = False
+            self._notify(peer, f"Could not start avatar update: {e}", account)
+
+    def _on_avatar_result(self, account, peer, in_photo, response, error):
+        if error is not None:
+            self.job_active = False
+            self._notify(peer, f"Avatar update failed after {self.stack_done} set(s): {error}", account)
+            return
+
+        self.stack_done += 1
+        if self.stack_done >= self.stack_total:
+            self.job_active = False
+            self._notify(peer, f"Done. Avatar was set {self.stack_done} time(s).", account)
+            return
+
+        delay_ms = int(self._float_setting("delay_sec", 1.2) * 1000)
+        self.handler.postDelayed(AvatarTask(lambda: self._do_next(account, peer, in_photo)), delay_ms)
