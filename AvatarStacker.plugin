@@ -234,7 +234,7 @@ class AvatarStackerPlugin(BasePlugin):
         try:
             req = TLRPC.TL_photos_updateProfilePhoto()
             req.flags = 0
-            req.photo = in_photo
+            req.id = in_photo
             send_request(req, RequestCallback(lambda response, error, _self=self, _a=account, _p=peer, _i=in_photo: _self._on_avatar_result(_a, _p, _i, response, error)), account=account)
         except Exception as e:
             self.job_active = False
