@@ -10,6 +10,12 @@ from java.chaquopy import dynamic_proxy
 from org.telegram.tgnet import TLRPC
 from ui.settings import Header, Text, Divider, Switch, Input
 
+try:
+    from client_utils import account_scope
+    _ACCOUNT_SCOPE = account_scope
+except Exception:
+    _ACCOUNT_SCOPE = None
+
 __id__ = "avatar_stacker"
 __name__ = "Avatar Stacker"
 __description__ = "Sets a photo as your profile avatar N times. Send a photo to Saved Messages, then reply to it (or write in the caption) `.ava <count>`."
@@ -79,9 +85,16 @@ class AvatarStackerPlugin(BasePlugin):
         uid = self._self_id(account)
         return uid is not None and peer == uid
 
+    def _scope(self, account):
+        if _ACCOUNT_SCOPE is None:
+            import contextlib
+            return contextlib.nullcontext()
+        return _ACCOUNT_SCOPE(account)
+
     def _notify(self, peer, text, account):
         try:
-            send_text(peer, text, account=account)
+            with self._scope(account):
+                send_text(peer, text)
         except Exception as e:
             log(f"AvatarStacker: notify error: {e}")
 
@@ -182,7 +195,8 @@ class AvatarStackerPlugin(BasePlugin):
             req.max_id = 0
             req.min_id = 0
             req.hash = 0
-            send_request(req, RequestCallback(lambda response, error, _self=self, _a=account, _p=peer, _c=count: _self._on_history(_a, _p, _c, 0, response, error)), account=account)
+            with self._scope(account):
+                send_request(req, RequestCallback(lambda response, error, _self=self, _a=account, _p=peer, _c=count: _self._on_history(_a, _p, _c, 0, response, error)))
         except Exception as e:
             log(f"AvatarStacker: getHistory error: {e}\n{traceback.format_exc()}")
 
@@ -235,7 +249,8 @@ class AvatarStackerPlugin(BasePlugin):
             req = TLRPC.TL_photos_updateProfilePhoto()
             req.flags = 0
             req.id = in_photo
-            send_request(req, RequestCallback(lambda response, error, _self=self, _a=account, _p=peer, _i=in_photo: _self._on_avatar_result(_a, _p, _i, response, error)), account=account)
+            with self._scope(account):
+                send_request(req, RequestCallback(lambda response, error, _self=self, _a=account, _p=peer, _i=in_photo: _self._on_avatar_result(_a, _p, _i, response, error)))
         except Exception as e:
             self.job_active = False
             self._notify(peer, f"Could not start avatar update: {e}", account)
