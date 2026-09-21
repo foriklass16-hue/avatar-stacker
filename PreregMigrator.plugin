@@ -20,7 +20,7 @@ __id__ = "prereg_migrator"
 __name__ = "Prereg Migrator"
 __description__ = "Migrates balances from the old bot to a new one. Reply `.prereg1` to the balances list, `.prereg2` to the old-timers id list, then run `.prereg start` and all `/prereg <id> <amount>` commands are sent."
 __author__ = "@exteraGram"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.3.3"
@@ -29,6 +29,9 @@ BALANCE_RE = re.compile(r"^\s*\d+[.)]?\s+(.+?)\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s*G
 OLDIES_RE = re.compile(r"^\s*\d+[.)]?\s+(.*?)\s*\(\s*[\d.,]+\s*k?\s*\)\s*(?:\u2014|-|\u2013).*$")
 EMOJI_RE = re.compile(r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]")
 ZW_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00a0]")
+TME_RE = re.compile(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)")
+TGID_RE = re.compile(r"tg://user\?id=(\d+)")
+USR_RE = re.compile(r"(?:^|\s)@([A-Za-z0-9_]+)")
 
 ENT_MENTION_NAME = 0xdc7b1140
 ENT_TEXT_URL = 0x76a6d327
@@ -197,77 +200,76 @@ class PreregMigratorPlugin(BasePlugin):
                 self._notify(peer, "Old-timers message has no text.", account)
                 return
             text = msg
-            u16 = self._u16map(text)
+            lines = text.split("\n")
 
-            line_offsets = []
-            offset = 0
-            for line in text.split("\n"):
-                line_offsets.append(offset)
-                offset += len(line) + 1
+            names = []
+            for li, line in enumerate(lines):
+                m = OLDIES_RE.match(line)
+                if m:
+                    names.append((m.group(1).strip(), li))
 
-            ents = []
-            entities = getattr(owner, "entities", None)
-            if entities is not None:
-                for i in range(entities.size() if hasattr(entities, "size") else len(entities)):
-                    ent = entities.get(i) if hasattr(entities, "get") else entities[i]
-                    es = u16.get(int(ent.offset))
-                    ee = u16.get(int(ent.offset) + int(ent.length))
-                    if es is None or ee is None or ee <= es:
-                        continue
-                    span = text[es:ee]
-                    eid = self._ent_id(ent, span)
-                    ents.append((es, ee, span, eid))
+            url_items = []
+            for li, line in enumerate(lines):
+                for vm in TGID_RE.finditer(line):
+                    url_items.append((li, "i", int(vm.group(1))))
+                for um in TME_RE.finditer(line):
+                    url_items.append((li, "u", um.group(1)))
+                if not TME_RE.search(line) and not TGID_RE.search(line):
+                    for at_m in USR_RE.finditer(line):
+                        url_items.append((li, "u", at_m.group(1)))
 
+            pairs = {}
+            j = 0
+            total = len(url_items)
+            for idx in range(len(names)):
+                nick, nli = names[idx]
+                nxt = names[idx + 1][1] if idx + 1 < len(names) else float("inf")
+                while j < total and url_items[j][0] < nli:
+                    j += 1
+                best = None
+                probe = j
+                while probe < total and url_items[probe][0] < nxt:
+                    if nli <= url_items[probe][0] <= nli + 2:
+                        best = url_items[probe]
+                        break
+                    probe += 1
+                if best is not None:
+                    pairs[nick] = best[1:]
+                    j = probe + 1
+                else:
+                    pairs[nick] = None
+
+            found = 0
             uid_map = self.olds.get(account) or {}
             pending = {}
-            found = 0
-            for li, line in enumerate(text.split("\n")):
-                m = OLDIES_RE.match(line)
-                if not m:
+            for nick, val in pairs.items():
+                if val is None:
                     continue
-                nick = m.group(1).strip()
-                ns = line_offsets[li] + m.start(1)
-                ne = line_offsets[li] + m.end(1)
-
-                best = None
-                best_len = None
-                for es, ee, span, eid in ents:
-                    if es >= ne or ee <= ns:
-                        continue
-                    length = ee - es
-                    if best_len is None or length < best_len:
-                        best = (es, ee, span, eid)
-                        best_len = length
-                if best is not None:
-                    span, eid = best[2], best[3]
-                else:
-                    span, eid = nick, None
-                    if nick.startswith("@"):
-                        eid = nick[1:]
-                if eid is None:
-                    continue
-                found += 1
                 visible = self._strip_emoji(nick) if self.get_setting("decoration_names", True) else nick
-                if isinstance(eid, int):
-                    for key in (self._norm(visible), self._core(visible), self._norm(span)):
-                        if key:
-                            uid_map[key] = eid
+                kind, data = val
+                found += 1
+                keys = []
+                for k in (self._norm(visible), self._core(visible)):
+                    if k:
+                        keys.append(k)
+                if kind == "i":
+                    for k in keys:
+                        uid_map[k] = data
                 else:
-                    uname = str(eid).lstrip("@")
-                    for key in (self._norm(visible), self._core(visible), self._norm(span).lstrip("@")):
-                        if key:
-                            pending[key] = uname
+                    uname = str(data).lstrip("@")
+                    for k in keys:
+                        pending[k] = uname
 
-            for key in pending:
+            for key in list(pending.keys()):
                 uid_map.pop(key, None)
 
             self.olds[account] = uid_map
             self.pending[account] = pending
             self.unresolved[account] = {}
             if found == 0:
-                self._notify(peer, "Could not find any ids/usernames (lines parsed ok, but no links/entities). Make sure the nicknames are tappable links.", account)
+                self._notify(peer, "Could not find any https://t.me/username links in the message. The old-timers list must contain such links (one per name).", account)
             else:
-                self._notify(peer, f"Ids saved: {found} link(s), {len(pending)} username(s) to resolve.", account)
+                self._notify(peer, f"Ids saved: {found} name(s) matched, {len(pending)} username(s) to resolve.", account)
             if pending:
                 self._resolve_loop(account)
         except Exception as e:
