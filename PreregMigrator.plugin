@@ -20,7 +20,7 @@ __id__ = "prereg_migrator"
 __name__ = "Prereg Migrator"
 __description__ = "Migrates balances from the old bot to a new one. Reply `.prereg1` to the balances list, `.prereg2` to the old-timers id list, then run `.prereg start` and all `/prereg <id> <amount>` commands are sent."
 __author__ = "@exteraGram"
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.3.3"
@@ -122,16 +122,32 @@ class PreregMigratorPlugin(BasePlugin):
         return None
 
     def _ent_id(self, ent, span):
-        cons = int(getattr(ent, "constructor", 0))
-        if cons == ENT_MENTION_NAME:
-            uid = int(getattr(ent, "user_id", 0) or 0)
-            return uid if uid else None
-        if cons == ENT_TEXT_URL:
-            return self._url_payload(getattr(ent, "url", ""))
-        if cons == ENT_URL:
-            return self._url_payload(span)
-        if cons == ENT_MENTION and str(span).startswith("@"):
-            return span[1:]
+        try:
+            uid = getattr(ent, "user_id", None)
+            if uid:
+                return int(uid)
+        except Exception:
+            pass
+        try:
+            url = getattr(ent, "url", None)
+            if url:
+                p = self._url_payload(str(url))
+                if p:
+                    return p
+        except Exception:
+            pass
+        s = str(span or "")
+        m = re.search(r"tg://user\?id=(\d+)", s)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"(?:^|\s)@([A-Za-z0-9_]+)", s)
+        if m:
+            return m.group(1)
+        if s.isdigit() and len(s) > 3:
+            return int(s)
         return None
 
     def on_send_message_hook(self, account, params):
@@ -201,6 +217,13 @@ class PreregMigratorPlugin(BasePlugin):
                 return
             text = msg
             lines = text.split("\n")
+            u16 = self._u16map(text)
+
+            line_spans = []
+            off = 0
+            for line in lines:
+                line_spans.append((off, off + len(line)))
+                off += len(line) + 1
 
             names = []
             for li, line in enumerate(lines):
@@ -218,26 +241,58 @@ class PreregMigratorPlugin(BasePlugin):
                     for at_m in USR_RE.finditer(line):
                         url_items.append((li, "u", at_m.group(1)))
 
+            ents = []
+            ent_count = 0
+            ent_sample = ""
+            entities = getattr(owner, "entities", None)
+            if entities is not None:
+                n = entities.size() if hasattr(entities, "size") else len(entities)
+                for i in range(n):
+                    ent = entities.get(i) if hasattr(entities, "get") else entities[i]
+                    ent_count += 1
+                    if not ent_sample:
+                        ent_sample = str(type(ent))
+                    try:
+                        os_ = int(ent.offset)
+                        ln = int(ent.length)
+                    except Exception:
+                        continue
+                    es = u16.get(os_)
+                    ee = u16.get(os_ + ln)
+                    if es is None or ee is None or ee <= es:
+                        continue
+                    span = text[es:ee]
+                    val = self._ent_id(ent, span)
+                    if val is not None:
+                        ents.append((es, ee, span, val))
+
             pairs = {}
-            j = 0
-            total = len(url_items)
             for idx in range(len(names)):
                 nick, nli = names[idx]
-                nxt = names[idx + 1][1] if idx + 1 < len(names) else float("inf")
-                while j < total and url_items[j][0] < nli:
-                    j += 1
-                best = None
-                probe = j
-                while probe < total and url_items[probe][0] < nxt:
-                    if nli <= url_items[probe][0] <= nli + 2:
-                        best = url_items[probe]
-                        break
-                    probe += 1
-                if best is not None:
-                    pairs[nick] = best[1:]
-                    j = probe + 1
-                else:
-                    pairs[nick] = None
+                val = None
+                if not val:
+                    for li_, kind_, data_ in url_items:
+                        if li_ == nli:
+                            val = (kind_, data_)
+                            break
+                if not val:
+                    for li_, kind_, data_ in url_items:
+                        if nli < li_ <= nli + 2:
+                            val = (kind_, data_)
+                            break
+                if not val:
+                    best = None
+                    bl = None
+                    for es, ee, span, ev in ents:
+                        if ee <= line_spans[nli][0] or es >= line_spans[nli][1]:
+                            continue
+                        l = ee - es
+                        if bl is None or l < bl:
+                            best = (span, ev)
+                            bl = l
+                    if best is not None:
+                        val = ("i" if isinstance(best[1], int) else "u", best[1])
+                pairs[nick] = val
 
             found = 0
             uid_map = self.olds.get(account) or {}
@@ -245,18 +300,15 @@ class PreregMigratorPlugin(BasePlugin):
             for nick, val in pairs.items():
                 if val is None:
                     continue
+                kind_, data_ = val
                 visible = self._strip_emoji(nick) if self.get_setting("decoration_names", True) else nick
-                kind, data = val
                 found += 1
-                keys = []
-                for k in (self._norm(visible), self._core(visible)):
-                    if k:
-                        keys.append(k)
-                if kind == "i":
+                keys = [k for k in (self._norm(visible), self._core(visible)) if k]
+                if kind_ == "i":
                     for k in keys:
-                        uid_map[k] = data
+                        uid_map[k] = int(data_)
                 else:
-                    uname = str(data).lstrip("@")
+                    uname = str(data_).lstrip("@")
                     for k in keys:
                         pending[k] = uname
 
@@ -267,7 +319,7 @@ class PreregMigratorPlugin(BasePlugin):
             self.pending[account] = pending
             self.unresolved[account] = {}
             if found == 0:
-                self._notify(peer, "Could not find any https://t.me/username links in the message. The old-timers list must contain such links (one per name).", account)
+                self._notify(peer, f"Found no links. Lines parsed: {len(names)}, entities in message: {ent_count} ({ent_sample}). Reply to a message where each nickname is a t.me link.", account)
             else:
                 self._notify(peer, f"Ids saved: {found} name(s) matched, {len(pending)} username(s) to resolve.", account)
             if pending:
