@@ -20,7 +20,7 @@ __id__ = "prereg_migrator"
 __name__ = "Prereg Migrator"
 __description__ = "Migrates balances from the old bot to a new one. Reply `.prereg1` to the balances list, `.prereg2` to the old-timers id list, then run `.prereg start` and all `/prereg <id> <amount>` commands are sent."
 __author__ = "@exteraGram"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.3.3"
@@ -29,6 +29,11 @@ BALANCE_RE = re.compile(r"^\s*\d+[.)]?\s+(.+?)\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s*G
 OLDIES_RE = re.compile(r"^\s*\d+[.)]?\s+(.*?)\s*\(\s*[\d.,]+\s*k?\s*\)\s*(?:\u2014|-|\u2013).*$")
 EMOJI_RE = re.compile(r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]")
 ZW_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00a0]")
+
+ENT_MENTION_NAME = 0xdc7b1140
+ENT_TEXT_URL = 0x76a6d327
+ENT_URL = 0x6ed02538
+ENT_MENTION = 0xfa04579d
 
 
 class AvatarTask(dynamic_proxy(Runnable)):
@@ -100,26 +105,30 @@ class PreregMigratorPlugin(BasePlugin):
         m[u] = len(text)
         return m
 
+    def _url_payload(self, url):
+        s = str(url)
+        m = re.search(r"tg://user\?id=(\d+)", s)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"tg://resolve\?domain=([A-Za-z0-9_]+)", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)", s)
+        if m:
+            return m.group(1)
+        return None
+
     def _ent_id(self, ent, span):
-        uid = getattr(ent, "user_id", 0)
-        if uid:
-            return int(uid)
-        url = getattr(ent, "url", None)
-        if url:
-            s = str(url)
-            m = re.search(r"tg://user\?id=(\d+)", s)
-            if m:
-                return int(m.group(1))
-            m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)", s)
-            if m:
-                return m.group(1)
-        tname = type(ent).__name__
-        if tname == "TL_messageEntityMention" and span.startswith("@"):
+        cons = int(getattr(ent, "constructor", 0))
+        if cons == ENT_MENTION_NAME:
+            uid = int(getattr(ent, "user_id", 0) or 0)
+            return uid if uid else None
+        if cons == ENT_TEXT_URL:
+            return self._url_payload(getattr(ent, "url", ""))
+        if cons == ENT_URL:
+            return self._url_payload(span)
+        if cons == ENT_MENTION and str(span).startswith("@"):
             return span[1:]
-        if tname == "TL_messageEntityUrl":
-            m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)", span)
-            if m:
-                return m.group(1)
         return None
 
     def on_send_message_hook(self, account, params):
@@ -138,7 +147,7 @@ class PreregMigratorPlugin(BasePlugin):
             if low in (".prereg1", ".prereg2"):
                 reply = getattr(params, "replyToMsg", None)
                 if reply is None or getattr(reply, "messageOwner", None) is None:
-                    self._notify(params.peer, "Reply `.prereg1`/`.prereg2` to the list message.", account)
+                    self._notify(params.peer, "Reply `.prereg1`/`.prereg2` to the list message and try again.", account)
                     return HookResult(strategy=HookStrategy.CANCEL)
                 if low == ".prereg1":
                     self._parse_balances(account, params.peer, reply)
@@ -147,12 +156,17 @@ class PreregMigratorPlugin(BasePlugin):
                 return HookResult(strategy=HookStrategy.CANCEL)
 
             if low == ".prereg":
-                self._notify(params.peer, "Usage: reply .prereg1 to balances, reply .prereg2 to the id list, then send .prereg start.", account)
+                self._notify(params.peer, "Usage: reply .prereg1 to balances, reply .prereg2 to the id list, then send .prereg start. If nothing happened, check the plugin log.", account)
                 return HookResult(strategy=HookStrategy.CANCEL)
 
             return HookResult()
         except Exception as e:
             log(f"Prereg: hook error: {e}\n{traceback.format_exc()}")
+            try:
+                with self._scope(account):
+                    send_text(params.peer, f"Prereg hook error: {e}")
+            except Exception:
+                pass
             return HookResult()
 
     def _parse_balances(self, account, peer, reply):
@@ -173,7 +187,7 @@ class PreregMigratorPlugin(BasePlugin):
             self._notify(peer, f"Balances saved: {len(items)} entries.", account)
         except Exception as e:
             log(f"Prereg: parse balances error: {e}\n{traceback.format_exc()}")
-            self._notify(peer, "Could not parse the balances message.", account)
+            self._notify(peer, f"Could not parse the balances message: {e}", account)
 
     def _parse_oldies(self, account, peer, reply):
         try:
@@ -192,10 +206,12 @@ class PreregMigratorPlugin(BasePlugin):
                 offset += len(line) + 1
 
             ents = []
-            if getattr(owner, "entities", None) is not None:
-                for ent in owner.entities:
-                    es = u16.get(ent.offset)
-                    ee = u16.get(ent.offset + ent.length)
+            entities = getattr(owner, "entities", None)
+            if entities is not None:
+                for i in range(entities.size() if hasattr(entities, "size") else len(entities)):
+                    ent = entities.get(i) if hasattr(entities, "get") else entities[i]
+                    es = u16.get(int(ent.offset))
+                    ee = u16.get(int(ent.offset) + int(ent.length))
                     if es is None or ee is None or ee <= es:
                         continue
                     span = text[es:ee]
@@ -222,31 +238,41 @@ class PreregMigratorPlugin(BasePlugin):
                     if best_len is None or length < best_len:
                         best = (es, ee, span, eid)
                         best_len = length
-                if best is None:
-                    continue
-                span, eid = best[2], best[3]
+                if best is not None:
+                    span, eid = best[2], best[3]
+                else:
+                    span, eid = nick, None
+                    if nick.startswith("@"):
+                        eid = nick[1:]
                 if eid is None:
                     continue
                 found += 1
-                if isinstance(eid, str):
-                    pending[self._norm(span) or self._core(nick)] = eid
-                    continue
                 visible = self._strip_emoji(nick) if self.get_setting("decoration_names", True) else nick
-                for key in (self._norm(visible), self._core(visible), self._norm(span)):
-                    if key:
-                        uid_map[key] = int(eid)
+                if isinstance(eid, int):
+                    for key in (self._norm(visible), self._core(visible), self._norm(span)):
+                        if key:
+                            uid_map[key] = eid
+                else:
+                    uname = str(eid).lstrip("@")
+                    for key in (self._norm(visible), self._core(visible), self._norm(span).lstrip("@")):
+                        if key:
+                            pending[key] = uname
+
+            for key in pending:
+                uid_map.pop(key, None)
 
             self.olds[account] = uid_map
             self.pending[account] = pending
             self.unresolved[account] = {}
-            if found == 0 and not pending:
-                self._notify(peer, "Could not find any links/ids in the old-timers message. Make sure the nicknames are tappable links.", account)
+            if found == 0:
+                self._notify(peer, "Could not find any ids/usernames (lines parsed ok, but no links/entities). Make sure the nicknames are tappable links.", account)
             else:
                 self._notify(peer, f"Ids saved: {found} link(s), {len(pending)} username(s) to resolve.", account)
             if pending:
                 self._resolve_loop(account)
         except Exception as e:
             log(f"Prereg: parse oldies error: {e}\n{traceback.format_exc()}")
+            self._notify(peer, f"Could not parse the old-timers message: {e}", account)
 
     def _strip_emoji(self, nick):
         s = str(nick).strip()
@@ -283,10 +309,14 @@ class PreregMigratorPlugin(BasePlugin):
         if key not in pending:
             return
         uname = pending.pop(key)
+        uid = None
         if error is None and response is not None and getattr(response, "users", None) is not None and response.users.size() > 0:
-            uid = response.users.get(0).id
+            uid = int(response.users.get(0).id)
+        if uid:
             uid_map = self.olds.get(account) or {}
-            uid_map[key] = int(uid)
+            uid_map[key] = uid
+            if self.get_setting("decoration_names", True):
+                uid_map[self._core(key)] = uid
             self.olds[account] = uid_map
         else:
             self.unresolved[account][key] = uname
@@ -324,6 +354,8 @@ class PreregMigratorPlugin(BasePlugin):
             uid = olds.get(self._norm(nick))
             if uid is None and self.get_setting("decoration_names", True):
                 uid = olds.get(self._core(nick))
+            if uid is None and self.get_setting("decoration_names", True):
+                uid = olds.get("@" + self._norm(nick))
             if uid:
                 commands.append(f"/prereg {uid} {amount}")
             else:
