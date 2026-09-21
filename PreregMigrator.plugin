@@ -1,0 +1,347 @@
+import re
+import traceback
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import send_request, RequestCallback, send_text
+from android_utils import log
+from android.os import Handler, Looper
+from java.lang import Runnable
+from java.chaquopy import dynamic_proxy
+from org.telegram.tgnet import TLRPC
+from ui.settings import Header, Text, Divider, Switch
+
+try:
+    from client_utils import account_scope
+    _ACCOUNT_SCOPE = account_scope
+except Exception:
+    _ACCOUNT_SCOPE = None
+
+__id__ = "prereg_migrator"
+__name__ = "Prereg Migrator"
+__description__ = "Migrates balances from the old bot to a new one. Reply `.prereg1` to the balances list, `.prereg2` to the old-timers id list, then run `.prereg start` and all `/prereg <id> <amount>` commands are sent."
+__author__ = "@exteraGram"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+BALANCE_RE = re.compile(r"^\s*\d+[.)]?\s+(.+?)\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s*GRAM\s*$", re.IGNORECASE)
+OLDIES_RE = re.compile(r"^\s*\d+[.)]?\s+(.*?)\s*\(\s*[\d.,]+\s*k?\s*\)\s*(?:\u2014|-|\u2013).*$")
+EMOJI_RE = re.compile(r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]")
+ZW_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00a0]")
+
+
+class AvatarTask(dynamic_proxy(Runnable)):
+    def __init__(self, runnable):
+        super().__init__()
+        self.runnable = runnable
+
+    def run(self):
+        self.runnable()
+
+
+class PreregMigratorPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self.handler = Handler(Looper.getMainLooper())
+        self.add_on_send_message_hook()
+        self.balances = {}
+        self.olds = {}
+        self.pending = {}
+        self.unresolved = {}
+
+    def create_settings(self):
+        return [
+            Header(text="Prereg Migrator"),
+            Text(text="Reply `.prereg1` to the balance list message, then `.prereg2` to the old-timers list, then send `.prereg start` inside Saved Messages."),
+            Divider(),
+            Switch(key="enabled", text="Enabled", default=True),
+            Switch(key="decoration_names", text="Try matching decorated names", default=True, subtext="Strip leading/trailing emojis when matching nicknames"),
+        ]
+
+    def _scope(self, account):
+        if _ACCOUNT_SCOPE is None:
+            import contextlib
+            return contextlib.nullcontext()
+        return _ACCOUNT_SCOPE(account)
+
+    def _notify(self, peer, text, account):
+        try:
+            with self._scope(account):
+                send_text(peer, text)
+        except Exception as e:
+            log(f"Prereg: notify error: {e}")
+
+    def _norm(self, name):
+        s = ZW_RE.sub("", str(name))
+        s = re.sub(r"\s+", " ", s).strip().lower()
+        return s
+
+    def _core(self, name):
+        s = self._norm(name)
+        for _ in range(30):
+            prev = s
+            s = re.sub(r"^" + EMOJI_RE.pattern + r"+", "", s)
+            if s == prev:
+                break
+        for _ in range(30):
+            prev = s
+            s = re.sub(r"" + EMOJI_RE.pattern + r"+$", "", s)
+            if s == prev:
+                break
+        return s.strip()
+
+    def _u16map(self, text):
+        m = {}
+        u = 0
+        for i, ch in enumerate(text):
+            m[u] = i
+            u += 2 if ord(ch) > 0xFFFF else 1
+        m[u] = len(text)
+        return m
+
+    def _ent_id(self, ent, span):
+        uid = getattr(ent, "user_id", 0)
+        if uid:
+            return int(uid)
+        url = getattr(ent, "url", None)
+        if url:
+            s = str(url)
+            m = re.search(r"tg://user\?id=(\d+)", s)
+            if m:
+                return int(m.group(1))
+            m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)", s)
+            if m:
+                return m.group(1)
+        tname = type(ent).__name__
+        if tname == "TL_messageEntityMention" and span.startswith("@"):
+            return span[1:]
+        if tname == "TL_messageEntityUrl":
+            m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)", span)
+            if m:
+                return m.group(1)
+        return None
+
+    def on_send_message_hook(self, account, params):
+        try:
+            if not hasattr(params, "message") or not isinstance(params.message, str):
+                return HookResult()
+            text = params.message.strip()
+            if not self.get_setting("enabled", True):
+                return HookResult()
+
+            low = text.lower()
+            if low == ".prereg start":
+                self._start_generation(account, params.peer)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            if low in (".prereg1", ".prereg2"):
+                reply = getattr(params, "replyToMsg", None)
+                if reply is None or getattr(reply, "messageOwner", None) is None:
+                    self._notify(params.peer, "Reply `.prereg1`/`.prereg2` to the list message.", account)
+                    return HookResult(strategy=HookStrategy.CANCEL)
+                if low == ".prereg1":
+                    self._parse_balances(account, params.peer, reply)
+                else:
+                    self._parse_oldies(account, params.peer, reply)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            if low == ".prereg":
+                self._notify(params.peer, "Usage: reply .prereg1 to balances, reply .prereg2 to the id list, then send .prereg start.", account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            return HookResult()
+        except Exception as e:
+            log(f"Prereg: hook error: {e}\n{traceback.format_exc()}")
+            return HookResult()
+
+    def _parse_balances(self, account, peer, reply):
+        try:
+            owner = reply.messageOwner
+            msg = owner.message
+            if not msg:
+                self._notify(peer, "Balance message has no text.", account)
+                return
+            items = []
+            for line in str(msg).split("\n"):
+                m = BALANCE_RE.match(line.strip())
+                if m:
+                    nick = m.group(1).strip()
+                    amount = int(m.group(2).replace(",", "").replace(" ", ""))
+                    items.append((nick, amount))
+            self.balances[account] = items
+            self._notify(peer, f"Balances saved: {len(items)} entries.", account)
+        except Exception as e:
+            log(f"Prereg: parse balances error: {e}\n{traceback.format_exc()}")
+            self._notify(peer, "Could not parse the balances message.", account)
+
+    def _parse_oldies(self, account, peer, reply):
+        try:
+            owner = reply.messageOwner
+            msg = str(owner.message) if owner.message else ""
+            if not msg:
+                self._notify(peer, "Old-timers message has no text.", account)
+                return
+            text = msg
+            u16 = self._u16map(text)
+
+            line_offsets = []
+            offset = 0
+            for line in text.split("\n"):
+                line_offsets.append(offset)
+                offset += len(line) + 1
+
+            ents = []
+            if getattr(owner, "entities", None) is not None:
+                for ent in owner.entities:
+                    es = u16.get(ent.offset)
+                    ee = u16.get(ent.offset + ent.length)
+                    if es is None or ee is None or ee <= es:
+                        continue
+                    span = text[es:ee]
+                    eid = self._ent_id(ent, span)
+                    ents.append((es, ee, span, eid))
+
+            uid_map = self.olds.get(account) or {}
+            pending = {}
+            found = 0
+            for li, line in enumerate(text.split("\n")):
+                m = OLDIES_RE.match(line)
+                if not m:
+                    continue
+                nick = m.group(1).strip()
+                ns = line_offsets[li] + m.start(1)
+                ne = line_offsets[li] + m.end(1)
+
+                best = None
+                best_len = None
+                for es, ee, span, eid in ents:
+                    if es >= ne or ee <= ns:
+                        continue
+                    length = ee - es
+                    if best_len is None or length < best_len:
+                        best = (es, ee, span, eid)
+                        best_len = length
+                if best is None:
+                    continue
+                span, eid = best[2], best[3]
+                if eid is None:
+                    continue
+                found += 1
+                if isinstance(eid, str):
+                    pending[self._norm(span) or self._core(nick)] = eid
+                    continue
+                visible = self._strip_emoji(nick) if self.get_setting("decoration_names", True) else nick
+                for key in (self._norm(visible), self._core(visible), self._norm(span)):
+                    if key:
+                        uid_map[key] = int(eid)
+
+            self.olds[account] = uid_map
+            self.pending[account] = pending
+            self.unresolved[account] = {}
+            if found == 0 and not pending:
+                self._notify(peer, "Could not find any links/ids in the old-timers message. Make sure the nicknames are tappable links.", account)
+            else:
+                self._notify(peer, f"Ids saved: {found} link(s), {len(pending)} username(s) to resolve.", account)
+            if pending:
+                self._resolve_loop(account)
+        except Exception as e:
+            log(f"Prereg: parse oldies error: {e}\n{traceback.format_exc()}")
+
+    def _strip_emoji(self, nick):
+        s = str(nick).strip()
+        for _ in range(30):
+            prev = s
+            s = re.sub(r"^" + EMOJI_RE.pattern + r"+", "", s).strip()
+            if s == prev:
+                break
+        for _ in range(30):
+            prev = s
+            s = re.sub(r"" + EMOJI_RE.pattern + r"+$", "", s).strip()
+            if s == prev:
+                break
+        return s
+
+    def _resolve_loop(self, account):
+        pending = self.pending.get(account) or {}
+        if not pending:
+            return
+        key = next(iter(pending))
+        uname = pending[key].lstrip("@")
+        try:
+            req = TLRPC.TL_contacts_resolveUsername()
+            req.username = uname
+            with self._scope(account):
+                send_request(req, RequestCallback(lambda response, error, _s=self, _a=account, _k=key: _s._on_resolved(_a, _k, response, error)))
+        except Exception as e:
+            log(f"Prereg: resolve error: {e}")
+            pending.pop(key, None)
+            self.handler.postDelayed(AvatarTask(lambda: self._resolve_loop(account)), 800)
+
+    def _on_resolved(self, account, key, response, error):
+        pending = self.pending.get(account) or {}
+        if key not in pending:
+            return
+        uname = pending.pop(key)
+        if error is None and response is not None and getattr(response, "users", None) is not None and response.users.size() > 0:
+            uid = response.users.get(0).id
+            uid_map = self.olds.get(account) or {}
+            uid_map[key] = int(uid)
+            self.olds[account] = uid_map
+        else:
+            self.unresolved[account][key] = uname
+        self.handler.postDelayed(AvatarTask(lambda: self._resolve_loop(account)), 800)
+
+    def _start_generation(self, account, peer):
+        balances = self.balances.get(account)
+        olds = self.olds.get(account)
+        if not balances:
+            self._notify(peer, "No balances saved. Reply .prereg1 to the balances message.", account)
+            return
+        if not olds:
+            self._notify(peer, "No ids saved. Reply .prereg2 to the old-timers message.", account)
+            return
+        if self.pending.get(account):
+            self._notify(peer, "Resolving usernames…", account)
+            self._wait_generation(account, peer, 0)
+            return
+        self._send_commands(account, peer)
+
+    def _wait_generation(self, account, peer, attempt):
+        if self.pending.get(account) and attempt < 60:
+            self.handler.postDelayed(AvatarTask(lambda: self._wait_generation(account, peer, attempt + 1)), 2000)
+            return
+        if self.pending.get(account):
+            self._notify(peer, "Some usernames could not be resolved and were skipped.", account)
+        self._send_commands(account, peer)
+
+    def _send_commands(self, account, peer):
+        balances = self.balances.get(account) or []
+        olds = self.olds.get(account) or {}
+        commands = []
+        unrecognized = []
+        for nick, amount in balances:
+            uid = olds.get(self._norm(nick))
+            if uid is None and self.get_setting("decoration_names", True):
+                uid = olds.get(self._core(nick))
+            if uid:
+                commands.append(f"/prereg {uid} {amount}")
+            else:
+                unrecognized.append(nick)
+        total = len(commands)
+        unrec = self.unresolved.get(account) or {}
+        self._cmd_send(account, peer, commands, 0)
+        if unrecognized:
+            self._notify(peer, f"Sent {total} commands. Unrecognized ({len(unrecognized)}): " + "; ".join(unrecognized) + ((" (no username resolved: " + "; ".join(unrec.values()) + ")") if unrec else ""), account)
+        else:
+            self._notify(peer, f"Sent {total} commands. All users recognized.", account)
+
+    def _cmd_send(self, account, peer, commands, idx):
+        if idx >= len(commands):
+            return
+        try:
+            with self._scope(account):
+                send_text(peer, commands[idx])
+        except Exception as e:
+            log(f"Prereg: send cmd error: {e}")
+        self.handler.postDelayed(AvatarTask(lambda: self._cmd_send(account, peer, commands, idx + 1)), 600)
